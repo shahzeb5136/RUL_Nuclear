@@ -2,14 +2,21 @@
 RUL Prediction Dashboard — Proof of Concept
 Remaining Useful Life prediction for industrial coolant pump assemblies.
 Bayesian hierarchical model with interactive parameter exploration.
+
+Every view is driven by one simulated fleet: each pump has a fixed observed
+health history, and the sidebar parameters control how the model projects
+that history forward. RUL posteriors are the first-passage times of those
+projected paths through the failure threshold.
 """
 
-import streamlit as st
+import re
+
 import numpy as np
+import pandas as pd
 import plotly.graph_objects as go
-import plotly.express as px
-from plotly.subplots import make_subplots
-from scipy.stats import gamma, weibull_min
+import plotly.io as pio
+import streamlit as st
+from scipy.stats import gaussian_kde
 
 # ── Page Config ──────────────────────────────────────────────────────
 st.set_page_config(
@@ -20,608 +27,820 @@ st.set_page_config(
 )
 
 # ── Theme Colors ─────────────────────────────────────────────────────
-NAVY = "#1B3A5C"
-ACCENT = "#2E75B6"
-LIGHT_BLUE = "#A8D0E6"
-GREEN = "#27AE60"
-AMBER = "#F39C12"
-RED = "#E74C3C"
-DARK_GRAY = "#2C3E50"
-MED_GRAY = "#7F8C8D"
-BG = "#FAFBFC"
+INK = "#0F172A"
+SLATE = "#475569"
+MUTED = "#94A3B8"
+GRID = "#E8EDF4"
+NAVY = "#1E3A5F"
+BLUE = "#2563EB"
+LIGHT_BLUE = "#93C5FD"
+GREEN = "#16A34A"
+AMBER = "#D97706"
+RED = "#DC2626"
+GRAY = "#64748B"
+FONT = "Inter, 'Segoe UI', sans-serif"
+
+STATUS_COLORS = {"Critical": RED, "Watch": AMBER, "Healthy": GREEN, "Offline": GRAY}
+
+
+def rgba(hex_color, alpha):
+    h = hex_color.lstrip("#")
+    r, g, b = (int(h[i:i + 2], 16) for i in (0, 2, 4))
+    return f"rgba({r},{g},{b},{alpha})"
+
+
+# ── Model Constants ──────────────────────────────────────────────────
+AS_OF = pd.Timestamp("2026-02-01")   # data snapshot date
+FLEET_SIZE = 32
+OFFLINE_IDS = {"CP-019"}             # sensor feed lost
+CRITICAL_MO = 3
+WATCH_MO = 12
+HORIZON = 120                        # projection horizon (months)
+N_TRAJ = 500
+DAYS_PER_MONTH = 30.4375
+LOCATIONS = ["Reactor Bldg A", "Reactor Bldg B", "Turbine Hall", "Aux Building", "Intake Structure"]
+
+# Planned outage windows, in months from the snapshot date
+OUTAGES = [
+    ("Spring 2026", 2.0, 3.5),
+    ("Fall 2026", 8.0, 9.5),
+    ("Spring 2027", 14.0, 15.5),
+    ("Fall 2027", 20.0, 21.5),
+    ("Spring 2028", 26.0, 27.5),
+]
+
+# Parameters the observed histories were generated with
+DEFAULTS = dict(
+    deg_rate=0.40,
+    deg_accel=0.005,
+    noise_std=0.35,
+    threshold=40,
+    wb_shape=3.5,
+    wb_scale=50,
+)
+
+
+def months_to_date(m):
+    return AS_OF + pd.to_timedelta(np.asarray(m) * DAYS_PER_MONTH, unit="D")
+
+
+def fmt_rul(x):
+    return f">{HORIZON}" if x >= HORIZON else f"{x:.1f}"
+
 
 # ── Custom CSS ───────────────────────────────────────────────────────
-st.markdown("""
+st.markdown(f"""
 <style>
-    @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;700&family=JetBrains+Mono:wght@400;500&display=swap');
+    .block-container {{
+        padding-top: 2.2rem;
+        padding-bottom: 3rem;
+        max-width: 1440px;
+    }}
+    header[data-testid="stHeader"] {{ background: transparent; }}
 
-    html, body, [class*="css"] {
-        font-family: 'DM Sans', sans-serif;
-    }
-    code, .stCode, pre {
-        font-family: 'JetBrains Mono', monospace !important;
-    }
-    .block-container {
-        padding-top: 2rem;
-        padding-bottom: 2rem;
-    }
-    h1, h2, h3 {
-        color: #1B3A5C;
-        font-weight: 700;
-    }
-    .metric-card {
-        background: white;
-        border-radius: 12px;
-        padding: 1.2rem 1.4rem;
-        border-left: 4px solid;
-        box-shadow: 0 1px 4px rgba(0,0,0,0.06);
-        margin-bottom: 0.5rem;
-    }
-    .metric-card h3 {
-        margin: 0 0 0.25rem 0;
-        font-size: 0.8rem;
+    /* White cards on the tinted page background */
+    div[class*="st-key-card"],
+    div[data-testid="stMetric"] {{
+        background: #FFFFFF;
+        box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+    }}
+
+    .hero {{
+        background: linear-gradient(120deg, #0F2440 0%, #1E3A5F 55%, #2563EB 130%);
+        border-radius: 16px;
+        padding: 1.8rem 2rem 1.6rem;
+        color: #F8FAFC;
+        margin-bottom: 1.4rem;
+        box-shadow: 0 8px 24px rgba(15, 36, 64, 0.18);
+    }}
+    .hero .eyebrow {{
+        font-size: 0.75rem;
+        letter-spacing: 0.12em;
         text-transform: uppercase;
-        letter-spacing: 0.05em;
-        color: #7F8C8D;
-        font-weight: 500;
-    }
-    .metric-card .value {
+        color: {LIGHT_BLUE};
+        font-weight: 600;
+    }}
+    .hero h1 {{
+        color: #FFFFFF;
         font-size: 2rem;
         font-weight: 700;
-        line-height: 1.1;
-    }
-    .metric-card .sub {
-        font-size: 0.78rem;
-        color: #7F8C8D;
-        margin-top: 0.2rem;
-    }
-    .healthy { border-color: #27AE60; }
-    .healthy .value { color: #27AE60; }
-    .watch { border-color: #F39C12; }
-    .watch .value { color: #F39C12; }
-    .critical { border-color: #E74C3C; }
-    .critical .value { color: #E74C3C; }
-    .offline { border-color: #7F8C8D; }
-    .offline .value { color: #7F8C8D; }
+        margin: 0.25rem 0 0.4rem;
+        padding: 0;
+        line-height: 1.2;
+    }}
+    .hero p {{
+        color: #CBD5E1;
+        margin: 0 0 0.9rem;
+        max-width: 760px;
+        font-size: 0.95rem;
+    }}
+    .chip {{
+        display: inline-block;
+        font-size: 0.75rem;
+        padding: 0.2rem 0.65rem;
+        margin: 0 0.4rem 0.3rem 0;
+        border-radius: 999px;
+        background: rgba(255,255,255,0.10);
+        border: 1px solid rgba(255,255,255,0.18);
+        color: #E2E8F0;
+    }}
 
-    .stSidebar [data-testid="stSidebarContent"] {
-        background: linear-gradient(180deg, #1B3A5C 0%, #0f2640 100%);
-        color: white;
-    }
-    .stSidebar h1, .stSidebar h2, .stSidebar h3,
-    .stSidebar label, .stSidebar .stMarkdown p,
-    .stSidebar .stMarkdown {
-        color: white !important;
-    }
-    .stSidebar [data-testid="stSidebarContent"] hr {
-        border-color: rgba(255,255,255,0.15);
-    }
-    div[data-testid="stMetricValue"] {
-        font-family: 'JetBrains Mono', monospace;
-    }
-    .plot-container { border-radius: 12px; overflow: hidden; }
+    .kpi {{
+        background: #FFFFFF;
+        border: 1px solid #E2E8F0;
+        border-radius: 14px;
+        padding: 1rem 1.15rem 0.95rem;
+        height: 100%;
+    }}
+    .kpi .label {{
+        display: flex;
+        align-items: center;
+        gap: 0.45rem;
+        font-size: 0.78rem;
+        font-weight: 600;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+        color: {SLATE};
+    }}
+    .kpi .dot {{
+        width: 9px; height: 9px; border-radius: 50%;
+        display: inline-block;
+    }}
+    .kpi .value {{
+        font-size: 2.1rem;
+        font-weight: 700;
+        line-height: 1.15;
+        margin-top: 0.35rem;
+        color: {INK};
+        font-variant-numeric: tabular-nums;
+    }}
+    .kpi .value small {{
+        font-size: 0.9rem;
+        font-weight: 500;
+        color: {MUTED};
+        margin-left: 0.3rem;
+    }}
+    .kpi .sub {{
+        font-size: 0.8rem;
+        color: {SLATE};
+        margin-top: 0.15rem;
+    }}
+    .kpi .bar {{
+        height: 4px;
+        border-radius: 4px;
+        background: {GRID};
+        margin-top: 0.7rem;
+        overflow: hidden;
+    }}
+    .kpi .bar span {{ display: block; height: 100%; border-radius: 4px; }}
+
+    .card-head .title {{
+        font-size: 1.02rem;
+        font-weight: 650;
+        color: {INK};
+    }}
+    .card-head .sub {{
+        font-size: 0.82rem;
+        color: {SLATE};
+        margin-top: 0.1rem;
+    }}
+
+    .section-label {{
+        font-size: 0.78rem;
+        font-weight: 600;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+        color: {MUTED};
+        margin: 1.2rem 0 0.5rem;
+    }}
+
+    button[role="tab"] p {{ font-size: 0.95rem; font-weight: 600; }}
+    div[data-testid="stMetric"] {{ padding: 0.9rem 1rem; }}
+    div[data-testid="stMetricValue"] {{ font-variant-numeric: tabular-nums; }}
 </style>
 """, unsafe_allow_html=True)
 
 
-# ── Sidebar ──────────────────────────────────────────────────────────
-with st.sidebar:
-    st.markdown("## ⚙️ RUL Model Parameters")
-    st.markdown("Adjust the Bayesian model inputs to explore how they affect predictions.")
-    st.markdown("---")
-
-    st.markdown("### Degradation Model")
-    deg_rate = st.slider("Degradation Rate", 0.1, 1.0, 0.40, 0.05,
-                         help="Average monthly health index decline")
-    deg_accel = st.slider("Degradation Acceleration", 0.001, 0.015, 0.005, 0.001,
-                          format="%.3f",
-                          help="Quadratic acceleration of degradation over time")
-    noise_std = st.slider("Process Noise (σ)", 0.1, 1.0, 0.35, 0.05,
-                          help="Stochastic variability in degradation path")
-
-    st.markdown("---")
-    st.markdown("### Failure Threshold")
-    failure_threshold = st.slider("Health Index Threshold", 20, 60, 40, 5,
-                                  help="Health index below which component is considered failed")
-
-    st.markdown("---")
-    st.markdown("### Fleet Parameters")
-    weibull_shape = st.slider("Weibull Shape (β)", 1.5, 6.0, 3.5, 0.1,
-                              help="Population failure distribution shape. Higher = more concentrated failures")
-    weibull_scale = st.slider("Weibull Scale (η, months)", 30, 80, 50, 1,
-                              help="Characteristic life in months")
-
-    st.markdown("---")
-    st.markdown("### RUL Distribution")
-    gamma_shape = st.slider("Gamma Shape (α)", 3.0, 15.0, 8.0, 0.5,
-                            help="Shape of the posterior RUL distribution")
-    gamma_scale = st.slider("Gamma Scale (β)", 1.0, 4.0, 2.3, 0.1,
-                            help="Scale of the posterior RUL distribution")
-
-    st.markdown("---")
-    st.caption("Proof of Concept · Synthetic Data · Feb 2026")
+# ── Plotly Template ──────────────────────────────────────────────────
+_axis = dict(
+    gridcolor=GRID, zeroline=False, linecolor="#CBD5E1", showline=True,
+    ticks="outside", tickcolor="#CBD5E1", ticklen=4, automargin=True,
+    title=dict(font=dict(size=12, color=SLATE), standoff=10),
+)
+pio.templates["rul"] = go.layout.Template(layout=go.Layout(
+    font=dict(family=FONT, size=12, color=SLATE),
+    paper_bgcolor="rgba(0,0,0,0)",
+    plot_bgcolor="rgba(0,0,0,0)",
+    colorway=[BLUE, NAVY, AMBER, GREEN, RED],
+    margin=dict(l=8, r=16, t=36, b=8),
+    xaxis=_axis,
+    yaxis=_axis,
+    legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0,
+                bgcolor="rgba(0,0,0,0)", font=dict(size=11)),
+    hoverlabel=dict(bgcolor="white", bordercolor=GRID, font=dict(family=FONT, color=INK)),
+))
+pio.templates.default = "rul"
+PLOT_CONFIG = {"displayModeBar": False}
 
 
-# ── Helper: Plotly Layout ────────────────────────────────────────────
-def base_layout(title="", xaxis_title="", yaxis_title="", height=480):
-    return dict(
-        title=dict(text=title, font=dict(size=18, color=NAVY, family="DM Sans")),
-        font=dict(family="DM Sans", size=12, color=DARK_GRAY),
-        plot_bgcolor=BG,
-        paper_bgcolor="white",
-        height=height,
-        margin=dict(l=60, r=30, t=60, b=60),
-        xaxis=dict(title=xaxis_title, gridcolor="#e8e8e8", zerolinecolor="#ddd"),
-        yaxis=dict(title=yaxis_title, gridcolor="#e8e8e8", zerolinecolor="#ddd"),
-        legend=dict(bgcolor="rgba(255,255,255,0.85)", bordercolor="#ddd", borderwidth=1),
+def chart_card(title, subtitle, fig, height=380):
+    with st.container(border=True, key="card_" + re.sub(r"\W+", "_", title)):
+        st.markdown(
+            f'<div class="card-head"><div class="title">{title}</div>'
+            f'<div class="sub">{subtitle}</div></div>',
+            unsafe_allow_html=True,
+        )
+        fig.update_layout(height=height, paper_bgcolor="white", plot_bgcolor="white")
+        st.plotly_chart(fig, width="stretch", theme=None, config=PLOT_CONFIG)
+
+
+def kpi_tile(label, value, sub, color, share=None, unit=""):
+    bar = ""
+    if share is not None:
+        bar = f'<div class="bar"><span style="width:{share * 100:.0f}%;background:{color}"></span></div>'
+    unit_html = f"<small>{unit}</small>" if unit else ""
+    return (
+        f'<div class="kpi"><div class="label"><span class="dot" style="background:{color}"></span>{label}</div>'
+        f'<div class="value">{value}{unit_html}</div><div class="sub">{sub}</div>{bar}</div>'
     )
+
+
+# ── Sidebar ──────────────────────────────────────────────────────────
+for key, val in DEFAULTS.items():
+    st.session_state.setdefault(key, val)
+
+
+def reset_params():
+    for k, v in DEFAULTS.items():
+        st.session_state[k] = v
+
+
+with st.sidebar:
+    st.markdown("## ⚙️ Model Parameters")
+    st.caption("Adjust the model assumptions. Observed histories stay fixed; "
+               "projections, RUL posteriors and fleet status update live.")
+
+    st.markdown("#### Degradation model")
+    deg_rate = st.slider("Degradation rate (HI / month)", 0.10, 1.00, step=0.05, key="deg_rate",
+                         help="Population-average linear decline of the health index per month")
+    deg_accel = st.slider("Degradation acceleration", 0.001, 0.015, step=0.001, format="%.3f",
+                          key="deg_accel", help="Quadratic wear-out term: degradation speeds up with age")
+    noise_std = st.slider("Process noise (σ)", 0.10, 1.00, step=0.05, key="noise_std",
+                          help="Month-to-month stochastic variability of the degradation path")
+
+    st.markdown("#### Failure definition")
+    failure_threshold = st.slider("Health index threshold", 20, 60, step=5, key="threshold",
+                                  help="A pump is considered failed once its health index drops below this")
+
+    st.markdown("#### Population prior (Weibull)")
+    weibull_shape = st.slider("Shape β", 1.5, 6.0, step=0.1, key="wb_shape",
+                              help="Higher β = failures concentrated around the characteristic life")
+    weibull_scale = st.slider("Scale η (months)", 30, 80, step=1, key="wb_scale",
+                              help="Characteristic life: age by which 63.2% of pumps have failed")
+
+    st.button("↺  Reset to defaults", on_click=reset_params, width="stretch")
+    st.markdown("---")
+    st.caption(f"Proof of concept · Synthetic data · Snapshot {AS_OF:%b %Y}")
+
+
+# ══════════════════════════════════════════════════════════════════════
+# MODEL
+# ══════════════════════════════════════════════════════════════════════
+@st.cache_data(show_spinner=False)
+def build_fleet():
+    """Static fleet metadata, component random effects and observed histories."""
+    rng = np.random.default_rng(120)
+    rows, histories = [], {}
+    d = DEFAULTS
+    for i in range(FLEET_SIZE):
+        cid = f"CP-{i + 1:03d}"
+        age = int(rng.integers(30, 74))
+        mult = float(rng.lognormal(0.0, 0.18))   # component-level random effect
+        installed = AS_OF - pd.DateOffset(months=age) - pd.Timedelta(days=int(rng.integers(0, 28)))
+
+        t = np.arange(age + 1)
+        walk = np.concatenate([[0.0], np.cumsum(rng.normal(0, 1, age))]) * d["noise_std"] * 0.6
+        hi = np.clip(100 - mult * (d["deg_rate"] * t + d["deg_accel"] * t**2) + walk, 0, 100)
+
+        # Sensor-derived observations scatter around the latent health state
+        meas = np.random.default_rng(500 + i).normal(0, 0.9, age + 1)
+        histories[cid] = np.clip(hi + meas, 0, 100)
+        rows.append(dict(
+            id=cid,
+            location=LOCATIONS[int(rng.integers(len(LOCATIONS)))],
+            installed=installed.date(),
+            age=age,
+            mult=mult,
+            hi=float(hi[-1]),
+            offline=cid in OFFLINE_IDS,
+        ))
+    return pd.DataFrame(rows), histories
+
+
+def first_crossing(paths, threshold):
+    """Fractional month at which each path first drops below threshold (HORIZON if never)."""
+    below = paths < threshold
+    hit = below.any(axis=1)
+    idx = np.argmax(below, axis=1)
+    rows = np.arange(len(paths))
+    prev = paths[rows, np.maximum(idx - 1, 0)]
+    cur = paths[rows, idx]
+    frac = np.where(idx > 0, (prev - threshold) / np.maximum(prev - cur, 1e-9), 0.0)
+    rul = np.where(idx > 0, idx - 1 + frac, 0.0)
+    return np.where(hit, rul, float(HORIZON))
+
+
+def target_outage(p10):
+    """Latest planned outage the pump survives to with ≥90% probability."""
+    if p10 > 24:
+        return "Routine monitoring"
+    feasible = [name for name, _, end in OUTAGES if end <= p10]
+    return feasible[-1] if feasible else "Expedite"
+
+
+@st.cache_data(show_spinner=False)
+def simulate_fleet(rate, accel, noise, threshold):
+    fleet, _ = build_fleet()
+    k = np.arange(HORIZON + 1)
+    sims, summary = {}, []
+    for i, row in enumerate(fleet.itertuples()):
+        if row.offline:
+            summary.append(dict(id=row.id, status="Offline"))
+            continue
+        rng = np.random.default_rng(1000 + i)
+        m = row.mult * np.exp(rng.normal(0, 0.10, (N_TRAJ, 1)))     # posterior on random effect
+        a = accel * np.exp(rng.normal(0, 0.20, (N_TRAJ, 1)))         # uncertainty on wear-out term
+        steps = rng.normal(0, 1, (N_TRAJ, HORIZON)) * noise
+        walk = np.hstack([np.zeros((N_TRAJ, 1)), np.cumsum(steps, axis=1)])
+        drop = m * (rate * k + a * ((row.age + k) ** 2 - row.age ** 2))
+        paths = row.hi - drop + walk
+
+        rul = first_crossing(paths, threshold)
+        p05, p10, p50, p95 = np.percentile(rul, [5, 10, 50, 95])
+        status = "Critical" if p50 < CRITICAL_MO else "Watch" if p50 < WATCH_MO else "Healthy"
+        sims[row.id] = dict(
+            rul=rul,
+            bands=np.percentile(paths, [10, 25, 50, 75, 90], axis=0),
+        )
+        summary.append(dict(
+            id=row.id, status=status, median=p50, p05=p05, p10=p10, p95=p95,
+            p_fail_6=float(np.mean(rul <= 6)), p_fail_12=float(np.mean(rul <= 12)),
+            target=target_outage(p10),
+        ))
+    summary = fleet.merge(pd.DataFrame(summary), on="id")
+    return summary, sims
+
+
+fleet_meta, histories = build_fleet()
+fleet, sims = simulate_fleet(deg_rate, deg_accel, noise_std, failure_threshold)
+active = fleet[~fleet["offline"]].sort_values("median")
+counts = fleet["status"].value_counts()
+expected_12 = active["p_fail_12"].sum()
 
 
 # ══════════════════════════════════════════════════════════════════════
 # HEADER
 # ══════════════════════════════════════════════════════════════════════
-st.markdown("# 🔧 Remaining Useful Life — Coolant Pump Fleet")
-st.markdown(
-    "Interactive proof-of-concept dashboard for the Bayesian hierarchical RUL prediction model. "
-    "Adjust parameters in the sidebar to explore how model inputs affect predictions."
-)
+st.markdown(f"""
+<div class="hero">
+    <div class="eyebrow">Predictive maintenance · Proof of concept</div>
+    <h1>Remaining Useful Life — Coolant Pump Fleet</h1>
+    <p>Bayesian hierarchical degradation model for {FLEET_SIZE} reactor coolant pump assemblies.
+    Tune the model in the sidebar and every forecast, status and maintenance window below re-computes.</p>
+    <span class="chip">📅 Snapshot {AS_OF:%d %b %Y}</span>
+    <span class="chip">🎲 {N_TRAJ} Monte Carlo paths / pump</span>
+    <span class="chip">🧪 Synthetic data</span>
+</div>
+""", unsafe_allow_html=True)
 
-# ══════════════════════════════════════════════════════════════════════
-# ROW 1: Fleet Status Cards
-# ══════════════════════════════════════════════════════════════════════
-st.markdown("---")
-st.markdown("### Fleet Health Overview")
+# ── Fleet KPIs ───────────────────────────────────────────────────────
+tiles = [
+    ("Healthy", f"{WATCH_MO}+ months median RUL"),
+    ("Watch", f"{CRITICAL_MO}–{WATCH_MO} months median RUL"),
+    ("Critical", f"&lt; {CRITICAL_MO} months median RUL"),
+    ("Offline", "No sensor data"),
+]
+cols = st.columns(5)
+for col, (status, sub) in zip(cols, tiles):
+    n = int(counts.get(status, 0))
+    col.markdown(kpi_tile(status, n, sub, STATUS_COLORS[status], share=n / FLEET_SIZE,
+                          unit=f"/ {FLEET_SIZE}"), unsafe_allow_html=True)
+cols[4].markdown(kpi_tile("Expected failures", f"{expected_12:.1f}",
+                          "Next 12 months, if no action is taken", NAVY), unsafe_allow_html=True)
 
-c1, c2, c3, c4 = st.columns(4)
-with c1:
-    st.markdown("""
-    <div class="metric-card healthy">
-        <h3>Healthy</h3>
-        <div class="value">23</div>
-        <div class="sub">12+ months RUL</div>
-    </div>""", unsafe_allow_html=True)
-with c2:
-    st.markdown("""
-    <div class="metric-card watch">
-        <h3>Watch List</h3>
-        <div class="value">6</div>
-        <div class="sub">3–12 months RUL</div>
-    </div>""", unsafe_allow_html=True)
-with c3:
-    st.markdown("""
-    <div class="metric-card critical">
-        <h3>Critical</h3>
-        <div class="value">2</div>
-        <div class="sub">&lt; 3 months RUL</div>
-    </div>""", unsafe_allow_html=True)
-with c4:
-    st.markdown("""
-    <div class="metric-card offline">
-        <h3>Offline</h3>
-        <div class="value">1</div>
-        <div class="sub">No data</div>
-    </div>""", unsafe_allow_html=True)
-
-
-# ══════════════════════════════════════════════════════════════════════
-# ROW 2: Component Table
-# ══════════════════════════════════════════════════════════════════════
-import pandas as pd
-
-components_df = pd.DataFrame([
-    {"Component": "CP-001", "Location": "Reactor Bldg A", "Installed": "2021-03-15", "Age (mo)": 59, "Median RUL": 18.2, "90% CI": "(12.4 – 27.1)", "Status": "🟢 Healthy"},
-    {"Component": "CP-002", "Location": "Reactor Bldg A", "Installed": "2020-11-08", "Age (mo)": 63, "Median RUL": 24.6, "90% CI": "(18.2 – 34.5)", "Status": "🟢 Healthy"},
-    {"Component": "CP-003", "Location": "Turbine Hall",   "Installed": "2019-06-22", "Age (mo)": 79, "Median RUL": 5.8,  "90% CI": "(2.1 – 10.3)",  "Status": "🟡 Watch"},
-    {"Component": "CP-004", "Location": "Reactor Bldg B", "Installed": "2021-09-01", "Age (mo)": 45, "Median RUL": 31.4, "90% CI": "(22.7 – 42.8)", "Status": "🟢 Healthy"},
-    {"Component": "CP-005", "Location": "Aux Building",   "Installed": "2020-01-17", "Age (mo)": 72, "Median RUL": 2.1,  "90% CI": "(0.4 – 4.8)",   "Status": "🔴 Critical"},
-    {"Component": "CP-006", "Location": "Turbine Hall",   "Installed": "2022-04-30", "Age (mo)": 38, "Median RUL": 28.9, "90% CI": "(20.1 – 38.6)", "Status": "🟢 Healthy"},
-    {"Component": "CP-007", "Location": "Reactor Bldg B", "Installed": "2019-12-10", "Age (mo)": 68, "Median RUL": 8.4,  "90% CI": "(4.2 – 14.1)",  "Status": "🟡 Watch"},
-    {"Component": "CP-008", "Location": "Aux Building",   "Installed": "2021-07-20", "Age (mo)": 52, "Median RUL": 1.8,  "90% CI": "(0.2 – 4.1)",   "Status": "🔴 Critical"},
-])
-
-st.dataframe(
-    components_df,
-    use_container_width=True,
-    hide_index=True,
-    column_config={
-        "Median RUL": st.column_config.NumberColumn(format="%.1f mo"),
-        "Age (mo)": st.column_config.NumberColumn(format="%d"),
-    }
+st.write("")
+tab_fleet, tab_comp, tab_pop, tab_method = st.tabs(
+    ["Fleet overview", "Component deep-dive", "Population & validation", "Methodology"]
 )
 
 
 # ══════════════════════════════════════════════════════════════════════
-# ROW 3: RUL Distribution + Degradation Trajectory
+# TAB 1: Fleet Overview
 # ══════════════════════════════════════════════════════════════════════
-st.markdown("---")
-col_left, col_right = st.columns(2)
-
-# ── RUL Probability Distribution ─────────────────────────────────────
-with col_left:
-    st.markdown("### RUL Probability Distribution")
-
-    np.random.seed(42)
-    rul_samples = gamma.rvs(a=gamma_shape, scale=gamma_scale, size=10000)
-    x_range = np.linspace(0, max(rul_samples.max(), 50), 500)
-    pdf_vals = gamma.pdf(x_range, a=gamma_shape, scale=gamma_scale)
-
-    p5 = np.percentile(rul_samples, 5)
-    p95 = np.percentile(rul_samples, 95)
-    median_rul = np.median(rul_samples)
-
-    fig_rul = go.Figure()
-
-    # Critical zone
-    fig_rul.add_vrect(x0=0, x1=3, fillcolor=RED, opacity=0.07,
-                      line_width=0, annotation_text="Critical<br>Zone",
-                      annotation_position="top left",
-                      annotation=dict(font=dict(size=10, color=RED)))
-
-    # 90% CI shading
-    mask = (x_range >= p5) & (x_range <= p95)
-    fig_rul.add_trace(go.Scatter(
-        x=np.concatenate([x_range[mask], x_range[mask][::-1]]),
-        y=np.concatenate([pdf_vals[mask], np.zeros(mask.sum())]),
-        fill='toself', fillcolor=f'rgba(46,117,182,0.2)',
-        line=dict(width=0),
-        name=f'90% PI ({p5:.1f} – {p95:.1f} mo)',
-        hoverinfo='skip',
-    ))
-
-    # Full distribution
-    fig_rul.add_trace(go.Scatter(
-        x=x_range, y=pdf_vals,
-        mode='lines', line=dict(color=ACCENT, width=2.5),
-        name='Posterior Distribution',
-    ))
-
-    # Median line
-    fig_rul.add_vline(x=median_rul, line_dash="dash", line_color=NAVY, line_width=2,
-                      annotation_text=f"Median: {median_rul:.1f} mo",
-                      annotation_position="top")
-
-    fig_rul.update_layout(**base_layout(
-        title="Component CP-005 — RUL Posterior",
-        xaxis_title="Remaining Useful Life (months)",
-        yaxis_title="Probability Density",
-    ))
-    st.plotly_chart(fig_rul, use_container_width=True)
-
-
-# ── Degradation Trajectory ───────────────────────────────────────────
-with col_right:
-    st.markdown("### Degradation Trajectory & Projection")
-
-    np.random.seed(7)
-    months_hist = np.arange(0, 59)
-    base_deg = 100 - 0.3 * months_hist - 0.004 * months_hist**2
-    noise_hist = np.cumsum(np.random.normal(0, 0.3, len(months_hist)))
-    health_hist = np.clip(base_deg + noise_hist, 0, 100)
-
-    months_future = np.arange(58, 90)
-    n_traj = 300
-    trajectories = []
-    for _ in range(n_traj):
-        rate = np.random.normal(deg_rate, 0.12)
-        accel = np.random.normal(deg_accel, 0.002)
-        nf = np.cumsum(np.random.normal(0, noise_std, len(months_future)))
-        traj = health_hist[-1] - rate * (months_future - 58) - accel * (months_future - 58)**2 + nf
-        trajectories.append(traj)
-    trajectories = np.array(trajectories)
-
-    med_traj = np.median(trajectories, axis=0)
-    p10 = np.percentile(trajectories, 10, axis=0)
-    p25 = np.percentile(trajectories, 25, axis=0)
-    p75 = np.percentile(trajectories, 75, axis=0)
-    p90 = np.percentile(trajectories, 90, axis=0)
-
-    fig_deg = go.Figure()
-
-    # Prediction envelopes
-    fig_deg.add_trace(go.Scatter(
-        x=np.concatenate([months_future, months_future[::-1]]),
-        y=np.concatenate([p90, p10[::-1]]),
-        fill='toself', fillcolor='rgba(46,117,182,0.1)',
-        line=dict(width=0), name='80% Envelope', hoverinfo='skip',
-    ))
-    fig_deg.add_trace(go.Scatter(
-        x=np.concatenate([months_future, months_future[::-1]]),
-        y=np.concatenate([p75, p25[::-1]]),
-        fill='toself', fillcolor='rgba(46,117,182,0.2)',
-        line=dict(width=0), name='50% Envelope', hoverinfo='skip',
-    ))
-
-    # Historical
-    fig_deg.add_trace(go.Scatter(
-        x=months_hist, y=health_hist,
-        mode='lines', line=dict(color=ACCENT, width=2.5),
-        name='Observed Health Index',
-    ))
-
-    # Predicted median
-    fig_deg.add_trace(go.Scatter(
-        x=months_future, y=med_traj,
-        mode='lines', line=dict(color=NAVY, width=2, dash='dash'),
-        name='Predicted Median',
-    ))
-
-    # Failure threshold
-    fig_deg.add_hline(y=failure_threshold, line_dash="dot", line_color=RED, line_width=2,
-                      annotation_text=f"Failure Threshold (HI={failure_threshold})",
-                      annotation_position="top left",
-                      annotation=dict(font=dict(color=RED, size=10)))
-
-    # NOW line
-    fig_deg.add_vline(x=58, line_color=MED_GRAY, line_width=1.5,
-                      annotation_text="NOW", annotation_position="top")
-
-    fig_deg.update_layout(**base_layout(
-        title="Component CP-003 — Degradation Projection",
-        xaxis_title="Component Age (months)",
-        yaxis_title="Health Index",
-    ))
-    fig_deg.update_yaxis(range=[15, 105])
-    st.plotly_chart(fig_deg, use_container_width=True)
-
-
-# ══════════════════════════════════════════════════════════════════════
-# ROW 4: Survival Curve + Feature Importance
-# ══════════════════════════════════════════════════════════════════════
-st.markdown("---")
-col_left2, col_right2 = st.columns(2)
-
-# ── Population Survival Analysis ─────────────────────────────────────
-with col_left2:
-    st.markdown("### Population Survival Analysis")
-
-    t = np.linspace(0, 80, 500)
-    surv_model = weibull_min.sf(t, c=weibull_shape, scale=weibull_scale)
-    surv_upper = weibull_min.sf(t, c=weibull_shape - 0.5, scale=weibull_scale + 3)
-    surv_lower = weibull_min.sf(t, c=weibull_shape + 0.5, scale=weibull_scale - 3)
-
-    # KM steps (simulated)
-    np.random.seed(123)
-    failure_times = np.sort(weibull_min.rvs(c=weibull_shape, scale=weibull_scale, size=45))
-    n_total = 75
-    km_times = [0]
-    km_surv = [1.0]
-    for ft in failure_times:
-        at_risk = n_total - np.sum(failure_times < ft)
-        if at_risk <= 0:
-            break
-        km_times.append(ft)
-        km_surv.append(km_surv[-1] * (1 - 1 / max(at_risk, 1)))
-    km_times.append(80)
-    km_surv.append(km_surv[-1])
-
-    fig_surv = go.Figure()
-
-    # Confidence band
-    fig_surv.add_trace(go.Scatter(
-        x=np.concatenate([t, t[::-1]]),
-        y=np.concatenate([surv_upper, surv_lower[::-1]]),
-        fill='toself', fillcolor='rgba(46,117,182,0.12)',
-        line=dict(width=0), name='95% Confidence Band', hoverinfo='skip',
-    ))
-
-    # KM estimate
-    fig_surv.add_trace(go.Scatter(
-        x=km_times, y=km_surv,
-        mode='lines', line=dict(color=DARK_GRAY, width=1.5, shape='hv'),
-        name='Kaplan-Meier (observed)',
-    ))
-
-    # Model prediction
-    fig_surv.add_trace(go.Scatter(
-        x=t, y=surv_model,
-        mode='lines', line=dict(color=ACCENT, width=2.5),
-        name='Bayesian Model Prediction',
-    ))
-
-    # Key percentile markers
-    for pct in [0.75, 0.50, 0.25]:
-        idx = np.argmin(np.abs(surv_model - pct))
-        t_pct = t[idx]
-        fig_surv.add_trace(go.Scatter(
-            x=[t_pct], y=[pct], mode='markers+text',
-            marker=dict(size=8, color=NAVY),
-            text=[f'{pct:.0%}: {t_pct:.0f} mo'], textposition='top right',
-            textfont=dict(size=10, color=DARK_GRAY),
-            showlegend=False,
-        ))
-
-    fig_surv.update_layout(**base_layout(
-        title=f"Coolant Pump Fleet Survival (β={weibull_shape}, η={weibull_scale})",
-        xaxis_title="Component Age (months)",
-        yaxis_title="Survival Probability",
-    ))
-    fig_surv.update_yaxis(range=[0, 1.05])
-    st.plotly_chart(fig_surv, use_container_width=True)
-
-
-# ── Degradation Drivers ──────────────────────────────────────────────
-with col_right2:
-    st.markdown("### Degradation Drivers (SHAP)")
-
-    features = [
-        "Load Factor (avg)", "Ambient Temperature", "Operating Hours",
-        "Seal Leak Rate", "Coolant Flow Rate", "Motor Current Draw",
-        "Discharge Pressure (Δ)", "Vibration Kurtosis",
-        "Vibration RMS (X)", "Bearing Temp (trend)",
-    ]
-    importance = np.array([0.026, 0.035, 0.048, 0.065, 0.072, 0.089, 0.118, 0.142, 0.187, 0.218])
-    colors_bar = [RED if v > 0.15 else AMBER if v > 0.08 else ACCENT for v in importance]
-
-    fig_shap = go.Figure()
-    fig_shap.add_trace(go.Bar(
-        y=features, x=importance,
-        orientation='h',
-        marker_color=colors_bar,
-        text=[f'{v:.1%}' for v in importance],
-        textposition='outside',
-        textfont=dict(size=11, color=DARK_GRAY),
-    ))
-    fig_shap.update_layout(**base_layout(
-        title="Component CP-005 — Feature Importance",
-        xaxis_title="Relative Importance (SHAP-based)",
-        height=480,
-    ))
-    fig_shap.update_layout(showlegend=False)
-    fig_shap.update_xaxis(range=[0, 0.28])
-    st.plotly_chart(fig_shap, use_container_width=True)
-
-
-# ══════════════════════════════════════════════════════════════════════
-# ROW 5: Maintenance Timeline + Model Validation
-# ══════════════════════════════════════════════════════════════════════
-st.markdown("---")
-col_left3, col_right3 = st.columns(2)
-
-# ── Maintenance Planning Timeline ────────────────────────────────────
-with col_left3:
-    st.markdown("### Maintenance Planning Timeline")
-
-    gantt_data = [
-        ("CP-008", 1.8, 0.2, 4.1, RED),
-        ("CP-005", 2.1, 0.4, 4.8, RED),
-        ("CP-003", 5.8, 2.1, 10.3, AMBER),
-        ("CP-007", 8.4, 4.2, 14.1, AMBER),
-        ("CP-009", 9.2, 5.5, 13.8, AMBER),
-        ("CP-012", 10.1, 6.0, 15.5, AMBER),
-        ("CP-015", 11.8, 7.1, 17.2, AMBER),
-        ("CP-011", 14.5, 9.2, 20.8, AMBER),
-        ("CP-001", 18.2, 12.4, 27.1, GREEN),
-        ("CP-010", 20.5, 14.1, 29.3, GREEN),
-        ("CP-002", 24.6, 18.2, 34.5, GREEN),
-        ("CP-004", 31.4, 22.7, 42.8, GREEN),
-        ("CP-006", 28.9, 20.1, 38.6, GREEN),
-    ]
-
+with tab_fleet:
+    # ── Maintenance Planning Timeline ────────────────────────────────
+    plan = active.head(15)
     fig_gantt = go.Figure()
 
-    for i, (cid, med, lo, hi, color) in enumerate(gantt_data):
-        # CI bar
+    for name, start, end in OUTAGES:
+        fig_gantt.add_vrect(
+            x0=start, x1=end, fillcolor=NAVY, opacity=0.08, line_width=0, layer="below",
+            annotation_text=name, annotation_position="top left",
+            annotation=dict(font=dict(size=10, color=NAVY)),
+        )
+
+    for status in ["Critical", "Watch", "Healthy"]:
+        sub = plan[plan["status"] == status]
+        if sub.empty:
+            continue
+        color = STATUS_COLORS[status]
+        hi = sub["p95"].clip(upper=36)
         fig_gantt.add_trace(go.Bar(
-            y=[cid], x=[hi - lo], base=[lo],
-            orientation='h',
-            marker_color=color, opacity=0.25,
-            showlegend=False, hoverinfo='skip',
+            y=sub["id"], base=sub["p05"], x=hi - sub["p05"],
+            orientation="h", marker=dict(color=rgba(color, 0.22), line=dict(width=0)),
+            width=0.55, showlegend=False, hoverinfo="skip",
         ))
-        # Median marker
         fig_gantt.add_trace(go.Scatter(
-            x=[med], y=[cid],
-            mode='markers',
-            marker=dict(size=10, color=color, symbol='diamond',
-                        line=dict(width=1.5, color='white')),
-            showlegend=False,
-            hovertemplate=f'{cid}: Median {med:.1f} mo<br>90% CI: ({lo:.1f} – {hi:.1f})<extra></extra>',
+            x=sub["median"], y=sub["id"], mode="markers", name=status,
+            marker=dict(size=11, color=color, symbol="diamond", line=dict(width=1.5, color="white")),
+            customdata=sub[["p05", "p95", "target"]].to_numpy(dtype=object),
+            hovertemplate="<b>%{y}</b><br>Median RUL %{x:.1f} mo"
+                          "<br>90% PI %{customdata[0]:.1f} – %{customdata[1]:.1f} mo"
+                          "<br>Plan: %{customdata[2]}<extra></extra>",
         ))
 
-    # Outage windows
-    fig_gantt.add_vrect(x0=3, x1=5, fillcolor=NAVY, opacity=0.06, line_width=0,
-                        annotation_text="Spring<br>Outage", annotation_position="top left",
-                        annotation=dict(font=dict(size=9, color=NAVY)))
-    fig_gantt.add_vrect(x0=15, x1=17, fillcolor=NAVY, opacity=0.06, line_width=0,
-                        annotation_text="Fall<br>Outage", annotation_position="top left",
-                        annotation=dict(font=dict(size=9, color=NAVY)))
+    ticks = np.arange(0, 31, 3)
+    fig_gantt.add_vline(x=0, line_color=SLATE, line_width=1.5)
+    fig_gantt.update_layout(barmode="overlay", bargap=0.35)
+    fig_gantt.update_xaxes(range=[-0.7, 30], tickvals=ticks,
+                           ticktext=[f"{d:%b %Y}" for d in months_to_date(ticks)])
+    fig_gantt.update_yaxes(autorange="reversed", showgrid=False,
+                           tickfont=dict(family="JetBrains Mono, monospace", size=11, color=INK))
 
-    fig_gantt.update_layout(**base_layout(
-        title="Predicted Replacement Windows",
-        xaxis_title="Months from Now",
-        height=520,
-    ))
-    fig_gantt.update_layout(barmode='overlay')
-    fig_gantt.update_yaxis(autorange="reversed", tickfont=dict(family="JetBrains Mono", size=11))
-    st.plotly_chart(fig_gantt, use_container_width=True)
-
-
-# ── Model Validation ─────────────────────────────────────────────────
-with col_right3:
-    st.markdown("### Model Validation Results")
-
-    fig_val = make_subplots(rows=1, cols=2,
-                            subplot_titles=("Predicted vs. Actual RUL", "Model Comparison — MAE"),
-                            horizontal_spacing=0.15)
-
-    # Scatter: predicted vs actual
-    np.random.seed(99)
-    n_test = 30
-    actual = np.random.uniform(2, 40, n_test)
-    predicted = np.clip(actual + np.random.normal(0, 3.5, n_test), 0, 50)
-    errors = np.abs(predicted - actual)
-    scatter_colors = [GREEN if e < 3 else AMBER if e < 6 else RED for e in errors]
-
-    fig_val.add_trace(go.Scatter(
-        x=actual, y=predicted, mode='markers',
-        marker=dict(size=8, color=scatter_colors, line=dict(width=0.8, color='white')),
-        name='Predictions', showlegend=False,
-    ), row=1, col=1)
-
-    # Perfect prediction line
-    fig_val.add_trace(go.Scatter(
-        x=[0, 45], y=[0, 45], mode='lines',
-        line=dict(color=MED_GRAY, dash='dash', width=1.5),
-        name='Perfect', showlegend=False,
-    ), row=1, col=1)
-
-    # Model comparison bars
-    models = ['Bayesian<br>Hierarchical', 'Hybrid<br>(Bayes+ML)', 'XGBoost',
-              'Random<br>Surv Forest', 'Weibull<br>Baseline']
-    mae_vals = [3.2, 2.8, 3.9, 4.1, 6.5]
-    bar_colors = [ACCENT, GREEN, ACCENT, ACCENT, ACCENT]
-
-    fig_val.add_trace(go.Bar(
-        x=models, y=mae_vals,
-        marker_color=bar_colors, opacity=0.8,
-        text=[f'{v:.1f}' for v in mae_vals], textposition='outside',
-        textfont=dict(size=11, color=DARK_GRAY),
-        name='MAE (months)', showlegend=False,
-    ), row=1, col=2)
-
-    fig_val.update_layout(
-        font=dict(family="DM Sans", size=12, color=DARK_GRAY),
-        plot_bgcolor=BG, paper_bgcolor="white",
-        height=520, margin=dict(l=50, r=30, t=60, b=60),
+    chart_card(
+        "Predicted failure windows vs. planned outages",
+        "15 most at-risk pumps · ◆ median failure date · bar = 90% prediction interval · "
+        "shaded = planned outage windows",
+        fig_gantt, height=520,
     )
-    fig_val.update_xaxes(title_text="Actual RUL (months)", row=1, col=1, gridcolor="#e8e8e8")
-    fig_val.update_yaxes(title_text="Predicted RUL (months)", row=1, col=1, gridcolor="#e8e8e8")
-    fig_val.update_xaxes(row=1, col=2, gridcolor="#e8e8e8")
-    fig_val.update_yaxes(title_text="MAE (months)", row=1, col=2, gridcolor="#e8e8e8", range=[0, 8])
 
-    st.plotly_chart(fig_val, use_container_width=True)
+    # ── Component Table ──────────────────────────────────────────────
+    st.markdown('<div class="section-label">Component register</div>', unsafe_allow_html=True)
+    status_order = {"Critical": 0, "Watch": 1, "Healthy": 2, "Offline": 3}
+    table = (
+        fleet.assign(_o=fleet["status"].map(status_order))
+        .sort_values(["_o", "median"])
+        .assign(
+            interval=lambda d: [
+                "—" if pd.isna(lo) else f"{fmt_rul(lo)} – {fmt_rul(hi)}"
+                for lo, hi in zip(d["p05"], d["p95"])
+            ],
+            p_fail_6=lambda d: d["p_fail_6"] * 100,
+            hi=lambda d: np.where(d["offline"], np.nan, d["hi"]),
+            target=lambda d: d["target"].fillna("Restore sensor feed"),
+        )
+        [["id", "status", "location", "age", "hi", "median", "interval", "p_fail_6", "target", "installed"]]
+    )
+    styled = table.style.map(
+        lambda s: f"color: {STATUS_COLORS[s]}; font-weight: 600", subset=["status"]
+    )
+    st.dataframe(
+        styled,
+        width="stretch",
+        hide_index=True,
+        height=420,
+        column_config={
+            "id": st.column_config.TextColumn("Component"),
+            "location": st.column_config.TextColumn("Location"),
+            "installed": st.column_config.DateColumn("Installed", format="YYYY-MM-DD"),
+            "age": st.column_config.NumberColumn("Age (mo)", format="%d"),
+            "hi": st.column_config.ProgressColumn("Health", min_value=0, max_value=100, format="%.0f",
+                                                  width="small"),
+            "median": st.column_config.NumberColumn("Median RUL (mo)", format="%.1f"),
+            "interval": st.column_config.TextColumn("90% PI (mo)"),
+            "p_fail_6": st.column_config.ProgressColumn("P(fail ≤ 6 mo)", min_value=0, max_value=100,
+                                                        format="%.0f%%"),
+            "target": st.column_config.TextColumn("Plan replacement at"),
+            "status": st.column_config.TextColumn("Status"),
+        },
+    )
+    st.caption("Replacement target = latest planned outage the pump reaches with ≥ 90% probability.")
 
 
 # ══════════════════════════════════════════════════════════════════════
-# ROW 6: Methodology Summary
+# TAB 2: Component Deep-Dive
 # ══════════════════════════════════════════════════════════════════════
-st.markdown("---")
-st.markdown("### Methodology Overview")
+with tab_comp:
+    ids = active["id"].tolist()
+    labels = {r.id: f"{r.id} · {r.location} · {r.status}" for r in active.itertuples()}
+    sel = st.selectbox("Component", ids, format_func=labels.get,
+                       help="Sorted from most to least at-risk")
+    row = active.set_index("id").loc[sel]
+    sim = sims[sel]
+    rul = sim["rul"]
 
-m1, m2, m3 = st.columns(3)
-with m1:
-    st.markdown("""
-    **Data Inputs**
-    - Daily sensor readings (vibration, temperature, pressure, flow)
-    - Maintenance event history (failures, repairs, inspections)
-    - Operating context (load, duty cycle, plant mode)
-    - Component metadata (manufacturer, install date, material)
-    """)
-with m2:
-    st.markdown("""
-    **Modelling Approach**
-    - Hierarchical Bayesian survival model with component-level random effects
-    - XGBoost feature engineering for health index construction
-    - SHAP-based explainability for degradation driver identification
-    - Hybrid ensemble achieving MAE of 2.8 months with 91% CI coverage
-    """)
-with m3:
-    st.markdown("""
-    **Dashboard Outputs**
-    - Fleet-wide health overview with status classification
-    - Per-component RUL posterior distributions with uncertainty
-    - Degradation trajectory projections with confidence fans
-    - Maintenance planning timelines aligned to outage windows
-    """)
+    status_color = STATUS_COLORS[row["status"]]
+    k1, k2, k3, k4 = st.columns(4)
+    k1.markdown(kpi_tile("Health index", f"{row['hi']:.0f}",
+                         f"{row['hi'] - failure_threshold:+.0f} points vs. failure threshold",
+                         status_color, share=row["hi"] / 100, unit="/ 100"), unsafe_allow_html=True)
+    k2.markdown(kpi_tile("Median RUL", fmt_rul(row["median"]),
+                         f"Expected failure ≈ {months_to_date(min(row['median'], HORIZON)):%b %Y}",
+                         status_color, unit="months"), unsafe_allow_html=True)
+    k3.markdown(kpi_tile("90% interval", f"{fmt_rul(row['p05'])}–{fmt_rul(row['p95'])}",
+                         "5th – 95th percentile of RUL", BLUE, unit="months"), unsafe_allow_html=True)
+    k4.markdown(kpi_tile("P(fail ≤ 6 months)", f"{row['p_fail_6']:.0%}", f"Plan: {row['target']}",
+                         status_color, share=row["p_fail_6"]), unsafe_allow_html=True)
+    st.write("")
+
+    c_left, c_right = st.columns(2)
+
+    # ── RUL Posterior ────────────────────────────────────────────────
+    with c_left:
+        fig_rul = go.Figure()
+        x_max = float(min(max(np.percentile(rul, 99.5) * 1.3, 6), HORIZON))
+        fig_rul.add_vrect(x0=0, x1=CRITICAL_MO, fillcolor=RED, opacity=0.07, line_width=0, layer="below")
+        fig_rul.add_vrect(x0=CRITICAL_MO, x1=min(WATCH_MO, x_max), fillcolor=AMBER, opacity=0.06,
+                          line_width=0, layer="below")
+
+        if np.ptp(rul) < 1e-6:
+            fig_rul.add_vline(x=float(rul[0]), line_color=BLUE, line_width=3)
+        else:
+            x = np.linspace(0, x_max, 400)
+            pdf = gaussian_kde(rul)(x)
+            # Reflect at zero so the density doesn't leak below 0 months
+            pdf += gaussian_kde(-rul)(x) if rul.min() < 2 else 0
+            inside = (x >= row["p05"]) & (x <= row["p95"])
+            fig_rul.add_trace(go.Scatter(
+                x=np.concatenate([x[inside], x[inside][::-1]]),
+                y=np.concatenate([pdf[inside], np.zeros(inside.sum())]),
+                fill="toself", fillcolor=rgba(BLUE, 0.16), line=dict(width=0),
+                name="90% prediction interval", hoverinfo="skip",
+            ))
+            fig_rul.add_trace(go.Scatter(
+                x=x, y=pdf, mode="lines", line=dict(color=BLUE, width=2.5), name="Posterior density",
+                hovertemplate="%{x:.1f} mo<extra></extra>",
+            ))
+        fig_rul.add_vline(x=row["median"], line_dash="dash", line_color=NAVY, line_width=1.8,
+                          annotation_text=f"Median {fmt_rul(row['median'])} mo",
+                          annotation_position="top right",
+                          annotation=dict(font=dict(color=NAVY, size=11)))
+        fig_rul.update_xaxes(title_text="Remaining useful life (months)", range=[0, x_max])
+        fig_rul.update_yaxes(title_text="Probability density", showticklabels=False)
+        censored = np.mean(rul >= HORIZON)
+        note = f" · {censored:.0%} of paths survive past {HORIZON} mo" if censored > 0.01 else ""
+        chart_card(f"{sel} — RUL posterior",
+                   f"First-passage time through HI = {failure_threshold} across {N_TRAJ} paths{note}",
+                   fig_rul)
+
+    # ── Degradation Trajectory ───────────────────────────────────────
+    with c_right:
+        hist = histories[sel]
+        age = int(row["age"])
+        p10, p25, p50, p75, p90 = sim["bands"]
+        n_fwd = int(np.clip(np.ceil(row["p95"]) + 6, 18, HORIZON))
+        fut = age + np.arange(n_fwd + 1)
+        sl = slice(0, n_fwd + 1)
+
+        fig_deg = go.Figure()
+        fig_deg.add_trace(go.Scatter(
+            x=np.concatenate([fut, fut[::-1]]), y=np.concatenate([p90[sl], p10[sl][::-1]]),
+            fill="toself", fillcolor=rgba(BLUE, 0.10), line=dict(width=0),
+            name="80% band", hoverinfo="skip",
+        ))
+        fig_deg.add_trace(go.Scatter(
+            x=np.concatenate([fut, fut[::-1]]), y=np.concatenate([p75[sl], p25[sl][::-1]]),
+            fill="toself", fillcolor=rgba(BLUE, 0.20), line=dict(width=0),
+            name="50% band", hoverinfo="skip",
+        ))
+        fig_deg.add_trace(go.Scatter(
+            x=np.arange(age + 1), y=hist, mode="lines", line=dict(color=NAVY, width=1.6),
+            name="Observed", hovertemplate="Age %{x} mo · HI %{y:.1f}<extra></extra>",
+        ))
+        fig_deg.add_trace(go.Scatter(
+            x=fut, y=p50[sl], mode="lines", line=dict(color=BLUE, width=2.2, dash="dash"),
+            name="Projected median", hovertemplate="Age %{x} mo · HI %{y:.1f}<extra></extra>",
+        ))
+        if row["median"] < HORIZON:
+            fig_deg.add_trace(go.Scatter(
+                x=[age + row["median"]], y=[failure_threshold], mode="markers",
+                marker=dict(size=11, color=RED, symbol="diamond", line=dict(width=1.5, color="white")),
+                name="Median failure", hovertemplate="Median failure at age %{x:.1f} mo<extra></extra>",
+            ))
+
+        fig_deg.add_hline(y=failure_threshold, line_dash="dot", line_color=RED, line_width=1.6,
+                          annotation_text=f"Failure threshold (HI {failure_threshold})",
+                          annotation_position="bottom left",
+                          annotation=dict(font=dict(color=RED, size=11)))
+        fig_deg.add_vline(x=age, line_color=SLATE, line_width=1.2,
+                          annotation_text="Now", annotation_position="top left",
+                          annotation=dict(font=dict(color=SLATE, size=11)))
+        y_low = max(0, min(failure_threshold, float(p10[n_fwd])) - 8)
+        fig_deg.update_xaxes(title_text="Component age (months)")
+        fig_deg.update_yaxes(title_text="Health index", range=[y_low, 103])
+        chart_card(f"{sel} — degradation trajectory & projection",
+                   f"{age} months of observed history · fan shows 50% and 80% projection bands",
+                   fig_deg)
+
+    # ── Degradation Drivers ──────────────────────────────────────────
+    features = [
+        "Bearing temperature (trend)", "Vibration RMS (X)", "Vibration kurtosis",
+        "Discharge pressure (Δ)", "Motor current draw", "Coolant flow rate",
+        "Seal leak rate", "Operating hours", "Ambient temperature", "Load factor (avg)",
+    ]
+    base_imp = np.array([0.218, 0.187, 0.142, 0.118, 0.089, 0.072, 0.065, 0.048, 0.035, 0.026])
+    imp = base_imp * np.random.default_rng(int(sel[3:])).lognormal(0, 0.25, len(base_imp))
+    imp = imp / imp.sum()
+    order = np.argsort(imp)
+    top3 = set(order[-3:])
+
+    fig_shap = go.Figure(go.Bar(
+        y=[features[i] for i in order], x=imp[order], orientation="h",
+        marker=dict(color=[NAVY if i in top3 else LIGHT_BLUE for i in order]),
+        text=[f"{v:.1%}" for v in imp[order]], textposition="outside",
+        textfont=dict(size=11, color=INK), cliponaxis=False,
+        hovertemplate="%{y}: %{x:.1%}<extra></extra>",
+    ))
+    fig_shap.update_xaxes(title_text="Share of mean |SHAP| contribution", tickformat=".0%",
+                          range=[0, imp.max() * 1.18])
+    fig_shap.update_yaxes(showgrid=False, tickfont=dict(color=INK))
+    fig_shap.update_layout(showlegend=False, margin=dict(t=12))
+    chart_card(f"{sel} — what is driving degradation",
+               "Relative feature contribution to the health-index model · top three drivers highlighted",
+               fig_shap, height=400)
+
+
+# ══════════════════════════════════════════════════════════════════════
+# TAB 3: Population & Validation
+# ══════════════════════════════════════════════════════════════════════
+with tab_pop:
+    p_left, p_right = st.columns(2)
+
+    # ── Population Survival Analysis ─────────────────────────────────
+    with p_left:
+        t = np.linspace(0, 100, 400)
+
+        def weibull_sf(tt, c, eta):
+            return np.exp(-(tt / eta) ** c)
+
+        rng = np.random.default_rng(123)
+        # Parameter uncertainty → 90% credible band
+        shapes = weibull_shape * np.exp(rng.normal(0, 0.08, 400))[:, None]
+        scales = weibull_scale * np.exp(rng.normal(0, 0.05, 400))[:, None]
+        band_lo, band_hi = np.percentile(weibull_sf(t, shapes, scales), [5, 95], axis=0)
+        surv = weibull_sf(t, weibull_shape, weibull_scale)
+
+        # Kaplan–Meier on a simulated, right-censored historical population
+        n_hist = 75
+        life = weibull_scale * (-np.log(rng.uniform(size=n_hist))) ** (1 / weibull_shape)
+        censor = rng.uniform(20, 90, n_hist)
+        obs = np.minimum(life, censor)
+        event = life <= censor
+        order_km = np.argsort(obs)
+        km_t, km_s, s, at_risk = [0.0], [1.0], 1.0, n_hist
+        for ti, ev in zip(obs[order_km], event[order_km]):
+            if ev:
+                s *= 1 - 1 / at_risk
+                km_t.append(ti)
+                km_s.append(s)
+            at_risk -= 1
+        km_t.append(obs.max())
+        km_s.append(s)
+
+        fig_surv = go.Figure()
+        fig_surv.add_trace(go.Scatter(
+            x=np.concatenate([t, t[::-1]]), y=np.concatenate([band_hi, band_lo[::-1]]),
+            fill="toself", fillcolor=rgba(BLUE, 0.13), line=dict(width=0),
+            name="90% credible band", hoverinfo="skip",
+        ))
+        fig_surv.add_trace(go.Scatter(
+            x=km_t, y=km_s, mode="lines", line=dict(color=INK, width=1.4, shape="hv"),
+            name=f"Kaplan–Meier ({event.sum()} failures / {n_hist})",
+            hovertemplate="%{x:.0f} mo · %{y:.0%}<extra></extra>",
+        ))
+        fig_surv.add_trace(go.Scatter(
+            x=t, y=surv, mode="lines", line=dict(color=BLUE, width=2.5), name="Weibull model",
+            hovertemplate="%{x:.0f} mo · %{y:.0%}<extra></extra>",
+        ))
+        for p, label in [(0.10, "B10"), (0.50, "B50")]:
+            tb = weibull_scale * (-np.log(1 - p)) ** (1 / weibull_shape)
+            fig_surv.add_trace(go.Scatter(
+                x=[tb], y=[1 - p], mode="markers+text", showlegend=False,
+                marker=dict(size=9, color=NAVY, line=dict(width=1.5, color="white")),
+                text=[f"{label} life: {tb:.0f} mo"], textposition="middle right",
+                textfont=dict(size=11, color=INK), hoverinfo="skip",
+            ))
+        # Where the current fleet sits on the curve
+        fig_surv.add_trace(go.Scatter(
+            x=fleet_meta["age"], y=np.full(FLEET_SIZE, 0.02), mode="markers",
+            marker=dict(symbol="line-ns-open", size=12, color=AMBER, line=dict(width=2)),
+            name="Current fleet ages", hovertemplate="%{x} mo<extra></extra>",
+        ))
+        fig_surv.update_xaxes(title_text="Component age (months)", range=[0, 100])
+        fig_surv.update_yaxes(title_text="Survival probability", range=[0, 1.04], tickformat=".0%")
+        fig_surv.update_layout(legend=dict(orientation="v", yanchor="top", y=0.98, xanchor="right", x=0.99,
+                                           bgcolor="rgba(255,255,255,0.9)"))
+        chart_card("Population survival curve",
+                   f"Weibull β = {weibull_shape:.1f}, η = {weibull_scale} months vs. observed "
+                   "Kaplan–Meier estimate", fig_surv, height=420)
+
+    # ── Model Validation: Predicted vs Actual ────────────────────────
+    with p_right:
+        rng = np.random.default_rng(99)
+        actual = rng.uniform(2, 40, 30)
+        noise = rng.normal(0, 1, 30)
+        predicted = np.clip(actual + noise * 2.8 / np.abs(noise).mean(), 0, 50)   # hybrid model, MAE 2.8
+        err = np.abs(predicted - actual)
+        pt_colors = [GREEN if e < 3 else AMBER if e < 6 else RED for e in err]
+
+        fig_pa = go.Figure()
+        fig_pa.add_trace(go.Scatter(
+            x=[0, 45, 45, 0], y=[3, 48, 42, -3], mode="lines", fill="toself", fillcolor=rgba(GREEN, 0.08),
+            line=dict(width=0), name="±3 months", hoverinfo="skip",
+        ))
+        fig_pa.add_trace(go.Scatter(
+            x=[0, 45], y=[0, 45], mode="lines", line=dict(color=MUTED, dash="dash", width=1.4),
+            name="Perfect prediction", hoverinfo="skip",
+        ))
+        fig_pa.add_trace(go.Scatter(
+            x=actual, y=predicted, mode="markers", showlegend=False,
+            marker=dict(size=9, color=pt_colors, line=dict(width=1, color="white")),
+            hovertemplate="Actual %{x:.1f} mo<br>Predicted %{y:.1f} mo<extra></extra>",
+        ))
+        fig_pa.update_xaxes(title_text="Actual RUL (months)", range=[0, 45])
+        fig_pa.update_yaxes(title_text="Predicted RUL (months)", range=[0, 48])
+        chart_card("Back-test: predicted vs. actual RUL",
+                   f"Hybrid model on 30 held-out failures · MAE {err.mean():.1f} months · "
+                   f"{np.mean(err < 3):.0%} within ±3 months<br>Error: "
+                   f'<span style="color:{GREEN}">● &lt; 3 mo</span> · '
+                   f'<span style="color:{AMBER}">● 3–6 mo</span> · '
+                   f'<span style="color:{RED}">● &gt; 6 mo</span>', fig_pa, height=420)
+
+    # ── Model Comparison ─────────────────────────────────────────────
+    models = ["Weibull baseline", "Random survival forest", "XGBoost",
+              "Bayesian hierarchical", "Hybrid (Bayes + ML)"]
+    mae_vals = [6.5, 4.1, 3.9, 3.2, 2.8]
+    coverage = [None, None, None, 0.89, 0.91]
+    fig_cmp = go.Figure(go.Bar(
+        y=models, x=mae_vals, orientation="h",
+        marker=dict(color=[MUTED, MUTED, MUTED, LIGHT_BLUE, BLUE]),
+        text=[f"{v:.1f} mo" + (f"  ·  {c:.0%} PI coverage" if c else "") for v, c in zip(mae_vals, coverage)],
+        textposition="outside", textfont=dict(size=11, color=INK), cliponaxis=False,
+        hovertemplate="%{y}: MAE %{x:.1f} months<extra></extra>",
+    ))
+    fig_cmp.update_xaxes(title_text="Mean absolute error (months) — lower is better", range=[0, 9.5])
+    fig_cmp.update_yaxes(showgrid=False, tickfont=dict(color=INK))
+    fig_cmp.update_layout(margin=dict(t=12))
+    chart_card("Model comparison", "Cross-validated mean absolute error on the same back-test set",
+               fig_cmp, height=280)
+
+
+# ══════════════════════════════════════════════════════════════════════
+# TAB 4: Methodology
+# ══════════════════════════════════════════════════════════════════════
+with tab_method:
+    mc1, mc2, mc3 = st.columns(3)
+    with mc1, st.container(border=True, key="card_method_1"):
+        st.markdown("""
+        ##### 📥 Data inputs
+        - Daily sensor readings (vibration, temperature, pressure, flow)
+        - Maintenance event history (failures, repairs, inspections)
+        - Operating context (load, duty cycle, plant mode)
+        - Component metadata (manufacturer, install date, material)
+        """)
+    with mc2, st.container(border=True, key="card_method_2"):
+        st.markdown("""
+        ##### 🧮 Modelling approach
+        - Hierarchical Bayesian degradation model with component-level random effects
+        - XGBoost feature engineering for health-index construction
+        - SHAP-based explainability for degradation driver identification
+        - Hybrid ensemble: MAE of 2.8 months with 91% interval coverage
+        """)
+    with mc3, st.container(border=True, key="card_method_3"):
+        st.markdown("""
+        ##### 📊 Dashboard outputs
+        - Fleet-wide health overview with status classification
+        - Per-component RUL posteriors with full uncertainty
+        - Degradation projections with confidence fans
+        - Replacement windows aligned to planned outages
+        """)
+
+    with st.container(border=True, key="card_method_how"):
+        st.markdown(f"""
+        #### How the numbers on this page are produced
+        1. **Health index.** Each pump's observed history follows
+           `HI(t) = 100 − mᵢ · (r·t + a·t²) + noise`, where `mᵢ` is the pump's random effect
+           (how fast it wears relative to the fleet).
+        2. **Projection.** From today's health index, {N_TRAJ} paths per pump are simulated with the
+           sidebar's rate `r`, acceleration `a` and noise `σ`, drawing `mᵢ` and `a` from their posteriors.
+        3. **RUL.** Each path's RUL is the first time it crosses the failure threshold; the
+           distribution of those times is the RUL posterior. Paths that never cross within
+           {HORIZON} months are right-censored at {HORIZON}.
+        4. **Status.** Median RUL < {CRITICAL_MO} months → *Critical*; < {WATCH_MO} months →
+           *Watch*; otherwise *Healthy*.
+        5. **Planning.** A pump is assigned the latest planned outage it reaches with ≥ 90% probability
+           (its 10th-percentile RUL). If none qualifies, replacement is expedited.
+        """)
 
 st.markdown("---")
-st.caption("RUL Prediction Dashboard · Proof of Concept · All data is synthetic · Built with Streamlit & Plotly")
+st.caption("RUL Prediction Dashboard · Proof of concept · All data is synthetic · Built with Streamlit & Plotly")
